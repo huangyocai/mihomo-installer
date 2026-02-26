@@ -24,31 +24,72 @@ require_root() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# pkg_install MANAGER PKG [PKG ...]
+# Installs one or more packages using the given package manager command.
+pkg_install() {
+  local mgr="$1"
+  shift
+  local pkgs=("$@")
+  "$mgr" -y install "${pkgs[@]}" >/dev/null
+}
+
 install_deps() {
+  local mgr=""
+
   if have_cmd dnf; then
-    dnf -y install curl gzip jq ca-certificates >/dev/null
-    # git 仅在安装 UI 时需要
-    if [[ "${INSTALL_UI:-0}" == "1" ]]; then dnf -y install git >/dev/null; fi
+    mgr="dnf"
   elif have_cmd yum; then
-    yum -y install curl gzip jq ca-certificates >/dev/null
-    if [[ "${INSTALL_UI:-0}" == "1" ]]; then yum -y install git >/dev/null; fi
+    mgr="yum"
   elif have_cmd apt-get; then
-    apt-get update -y >/dev/null
-    apt-get install -y curl gzip jq ca-certificates >/dev/null
-    if [[ "${INSTALL_UI:-0}" == "1" ]]; then apt-get install -y git >/dev/null; fi
+    mgr="apt-get"
   else
     echo "No supported package manager found (dnf/yum/apt-get)."
+    exit 1
+  fi
+
+  echo "[+] Installing dependencies via ${mgr}..."
+
+  if [[ "$mgr" == "apt-get" ]]; then
+    apt-get update -y >/dev/null
+  fi
+
+  pkg_install "$mgr" curl gzip jq ca-certificates
+
+  if [[ "${INSTALL_UI:-0}" == "1" ]]; then
+    echo "[+] Installing git via ${mgr} (required for UI install)..."
+    pkg_install "$mgr" git
+  fi
+
+  local missing=()
+  local dep
+  for dep in curl jq gzip; do
+    if ! have_cmd "$dep"; then
+      missing+=("$dep")
+    fi
+  done
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "[-] Required commands not available after install: ${missing[*]}"
+    echo "    Please install them manually and re-run the script."
     exit 1
   fi
 }
 
 detect_cpu_level() {
   local level="v1"
-  # 优先用 glibc micro-arch level 判断（最靠谱）
+  local ld_bin=""
+  # Check RHEL path first, then Debian path as fallback
   if [[ -x /lib64/ld-linux-x86-64.so.2 ]]; then
-    if /lib64/ld-linux-x86-64.so.2 --help 2>/dev/null | grep -q "x86-64-v3 (supported"; then
+    ld_bin="/lib64/ld-linux-x86-64.so.2"
+  elif [[ -x /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 ]]; then
+    ld_bin="/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
+  fi
+  if [[ -n "$ld_bin" ]]; then
+    local ld_help
+    ld_help="$("$ld_bin" --help 2>/dev/null || true)"
+    if echo "$ld_help" | grep -q "x86-64-v3 (supported"; then
       level="v3"
-    elif /lib64/ld-linux-x86-64.so.2 --help 2>/dev/null | grep -q "x86-64-v2 (supported"; then
+    elif echo "$ld_help" | grep -q "x86-64-v2 (supported"; then
       level="v2"
     fi
   fi
@@ -72,6 +113,10 @@ download_mihomo() {
   json="$(curl -fsSL --connect-timeout 10 --max-time 30 \
     https://api.github.com/repos/MetaCubeX/mihomo/releases/latest)"
 
+  local tag
+  tag="$(echo "$json" | jq -r '.tag_name')"
+  echo "[+] Latest release: ${tag}"
+
   local url
   url="$(echo "$json" | jq -r '.assets[].browser_download_url' \
     | grep -E "mihomo-linux-amd64-${level}.*\.gz$" | head -n1 || true)"
@@ -85,13 +130,13 @@ download_mihomo() {
   echo "[+] Downloading: $url"
   local tmpdir="/tmp/mihomo_install.$$"
   mkdir -p "$tmpdir"
+  trap 'rm -rf "$tmpdir"' RETURN
 
   curl -L --fail --connect-timeout 10 --max-time 120 "$url" -o "$tmpdir/mihomo.gz"
   gzip -dc "$tmpdir/mihomo.gz" > "$tmpdir/mihomo"
   chmod +x "$tmpdir/mihomo"
 
   mv "$tmpdir/mihomo" /usr/local/bin/mihomo
-  rm -rf "$tmpdir"
 
   echo "[+] mihomo installed to /usr/local/bin/mihomo"
   /usr/local/bin/mihomo -v || true
@@ -99,11 +144,13 @@ download_mihomo() {
 
 backup_file() {
   local f="$1"
+  local dest="${2:-}"
   if [[ -f "$f" ]]; then
     local ts
     ts="$(date +%Y%m%d_%H%M%S)"
-    cp -a "$f" "${f}.bak_${ts}"
-    echo "[i] Backup: $f -> ${f}.bak_${ts}"
+    local target="${dest:-${f}.bak_${ts}}"
+    cp -a "$f" "$target"
+    echo "[i] Backup: $f -> ${target}"
   fi
 }
 
@@ -120,6 +167,18 @@ write_config() {
 
   local mixed_port="${MIXED_PORT:-7890}"
   local ctrl_addr="${CTRL_ADDR:-127.0.0.1:9090}"
+
+  # Validate mixed_port is a number in range 1-65535
+  if ! [[ "$mixed_port" =~ ^[0-9]+$ ]] || (( mixed_port < 1 || mixed_port > 65535 )); then
+    echo "[-] MIXED_PORT '${mixed_port}' is invalid. Must be a number between 1 and 65535."
+    exit 1
+  fi
+
+  # Validate ctrl_addr matches host:port pattern
+  if ! [[ "$ctrl_addr" =~ ^[^:]+:[0-9]+$ ]]; then
+    echo "[-] CTRL_ADDR '${ctrl_addr}' is invalid. Must match the pattern host:port."
+    exit 1
+  fi
 
   local secret="${SECRET:-}"
   if [[ -z "$secret" ]]; then
@@ -202,6 +261,12 @@ EOF
 
   chmod 600 "$cfg"
 
+  # Sanity check: verify the written file is non-empty
+  if [[ ! -s "$cfg" ]]; then
+    echo "[-] Config file '${cfg}' is empty after writing. Something went wrong."
+    exit 1
+  fi
+
   echo "[+] Wrote config: $cfg"
   echo "[i] API secret => ${secret}"
 }
@@ -230,6 +295,24 @@ EOF
   systemctl daemon-reload
   systemctl enable --now mihomo
   echo "[+] systemd service enabled: mihomo"
+
+  local i=0
+  local active=0
+  while [[ $i -lt 5 ]]; do
+    sleep 1
+    if systemctl is-active --quiet mihomo; then
+      active=1
+      break
+    fi
+    i=$(( i + 1 ))
+  done
+
+  if [[ "$active" -eq 1 ]]; then
+    echo "[+] mihomo is active (running)."
+  else
+    echo "[!] Warning: mihomo did not reach active (running) state within 5 seconds. Please investigate."
+  fi
+
   systemctl --no-pager --full status mihomo || true
 }
 
@@ -244,11 +327,17 @@ install_ui() {
   fi
 
   echo "[+] Installing metacubexd (gh-pages) to /etc/mihomo/ui ..."
+
+  if [[ -d /etc/mihomo/ui ]]; then
+    echo "[i] Removing existing UI directory..."
+  fi
   rm -rf /etc/mihomo/ui
 
   # 浅克隆更快
   if git clone --depth 1 -b gh-pages https://github.com/MetaCubeX/metacubexd.git /etc/mihomo/ui; then
-    echo "[+] UI installed at /etc/mihomo/ui"
+    local file_count
+    file_count="$(find /etc/mihomo/ui -type f | wc -l)"
+    echo "[+] UI installed: ${file_count} files at /etc/mihomo/ui"
   else
     echo "[-] UI clone failed (network/proxy). You can retry later with proxy-enabled git."
     return
@@ -257,7 +346,6 @@ install_ui() {
   # 确保 config 里有 external-ui
   if ! grep -qE '^\s*external-ui:\s*/etc/mihomo/ui\s*$' /etc/mihomo/config.yaml 2>/dev/null; then
     echo "[i] Adding external-ui to config..."
-    # 插到 secret 后面（简单处理：追加也可用）
     printf '\nexternal-ui: /etc/mihomo/ui\n' >> /etc/mihomo/config.yaml
   fi
 
@@ -276,6 +364,10 @@ final_tips() {
   echo
   echo "Test proxy:"
   echo "  curl -x http://127.0.0.1:${mixed_port} -s https://ifconfig.me ; echo"
+  echo
+  echo "Shell-level proxy env vars:"
+  echo "  export http_proxy=http://127.0.0.1:${mixed_port}"
+  echo "  export https_proxy=http://127.0.0.1:${mixed_port}"
   echo
   if [[ "${INSTALL_UI:-0}" == "1" ]]; then
     echo "Web UI (recommended via SSH tunnel, on your local PC):"
